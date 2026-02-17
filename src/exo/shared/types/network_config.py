@@ -6,6 +6,7 @@ from exo.utils.pydantic_ext import FrozenModel
 class PeerAddress(FrozenModel):
     ip: str  # IPv4 or IPv6 address
     port: int  # TCP port (1-65535)
+    active_models: list[str] = []  # Optional list of active models on this peer
 
     @field_validator("port")
     @classmethod
