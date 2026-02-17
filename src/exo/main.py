@@ -1,16 +1,20 @@
 import argparse
 import itertools
+import json
 import multiprocessing as mp
 import os
 import resource
 import signal
+import socket
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Iterator, Self
 
 import anyio
+import httpx
 from anyio.abc import TaskGroup
 from loguru import logger
-from pydantic import PositiveInt
+from pydantic import PositiveInt, ValidationError
 
 import exo.routing.topics as topics
 from exo.download.coordinator import DownloadCoordinator
@@ -18,13 +22,118 @@ from exo.download.impl_shard_downloader import exo_shard_downloader
 from exo.master.api import API  # TODO: should API be in master?
 from exo.master.main import Master
 from exo.routing.router import Router, get_node_id_keypair
-from exo.shared.constants import EXO_LOG
+from exo.shared.constants import EXO_CONFIG_HOME, EXO_LOG
 from exo.shared.election import Election, ElectionResult
 from exo.shared.logging import logger_cleanup, logger_setup
 from exo.shared.types.common import NodeId, SessionId
+from exo.shared.types.network_config import NetworkConfig
 from exo.utils.channels import Receiver, channel
 from exo.utils.pydantic_ext import CamelCaseModel
 from exo.worker.main import Worker
+
+
+def get_node_host() -> str:
+    """Get the node's external IP address by connecting to a public DNS server."""
+    try:
+        # Create a socket to determine the local IP used for external connections
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            # Connect to Google's public DNS (doesn't actually send data)
+            s.connect(("8.8.8.8", 80))
+            sockname = s.getsockname()  # pyright: ignore[reportAny]
+            return str(sockname[0])  # pyright: ignore[reportAny]
+    except Exception:
+        # Fallback to localhost if detection fails
+        return "127.0.0.1"
+
+
+async def register_with_orchestrator(
+    orchestrator: str,
+    node_name: str,
+    node_host: str,
+    node_port: int,
+) -> NetworkConfig:
+    """Register with orchestrator server and get peer configuration."""
+    # Parse orchestrator address
+    if ":" not in orchestrator:
+        raise ValueError(
+            f"Orchestrator address must be in format 'ip:port', got: {orchestrator}"
+        )
+
+    orch_host, orch_port_str = orchestrator.rsplit(":", 1)
+    try:
+        orch_port = int(orch_port_str)
+    except ValueError as e:
+        raise ValueError(
+            f"Invalid orchestrator port '{orch_port_str}', must be an integer"
+        ) from e
+
+    orchestrator_url = f"http://{orch_host}:{orch_port}/register"
+
+    # Prepare registration payload
+    payload = {
+        "name": node_name,
+        "ip": node_host,
+        "port": node_port,
+    }
+
+    logger.info(
+        f"Registering with orchestrator at {orchestrator_url} as {node_name} ({node_host}:{node_port})"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(orchestrator_url, json=payload)
+            response.raise_for_status()
+            data: object = response.json()  # pyright: ignore[reportAny]
+            return NetworkConfig.model_validate(data)
+    except httpx.HTTPError as e:
+        raise RuntimeError(f"Failed to register with orchestrator: {e}") from e
+    except ValidationError as e:
+        raise ValueError(f"Invalid peer configuration from orchestrator: {e}") from e
+
+
+async def load_network_config_from_file(peers_file: str | None) -> NetworkConfig:
+    """Load and validate peer configuration from JSON file."""
+    if peers_file is None:
+        # Check default location
+        default_path = Path(EXO_CONFIG_HOME) / "peers.json"
+        if not default_path.exists():
+            raise RuntimeError(
+                "No peer configuration file found. "
+                f"Create {default_path} or specify --peers-file. "
+                "See docs/peers-config.md for format."
+            )
+        peers_file = str(default_path)
+
+    path = Path(peers_file)
+    if not path.exists():
+        raise FileNotFoundError(f"Peer config file not found: {peers_file}")
+
+    try:
+        content = await anyio.Path(path).read_text()
+        data: object = json.loads(content)  # pyright: ignore[reportAny]
+        return NetworkConfig.model_validate(data)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in peer config: {e}") from e
+    except ValidationError as e:
+        raise ValueError(f"Invalid peer configuration: {e}") from e
+
+
+async def load_network_config(args: "Args") -> NetworkConfig:
+    """Load network configuration from orchestrator or file."""
+    if args.orchestrator:
+        # Orchestrator mode - register and get peers
+        node_name = args.node_name or socket.gethostname()
+        node_host = args.node_host or get_node_host()
+        return await register_with_orchestrator(
+            args.orchestrator,
+            node_name,
+            node_host,
+            args.api_port,
+        )
+    else:
+        # File mode - load from JSON file
+        return await load_network_config_from_file(args.peers_file)
 
 
 @dataclass
@@ -43,10 +152,13 @@ class Node:
 
     @classmethod
     async def create(cls, args: "Args") -> "Self":
+        # Load peer configuration
+        network_config = await load_network_config(args)
+
         keypair = get_node_id_keypair()
         node_id = NodeId(keypair.to_peer_id().to_base58())
         session_id = SessionId(master_node_id=node_id, election_clock=0)
-        router = Router.create(keypair)
+        router = Router.create(keypair, network_config)
         await router.register_topic(topics.GLOBAL_EVENTS)
         await router.register_topic(topics.LOCAL_EVENTS)
         await router.register_topic(topics.COMMANDS)
@@ -283,6 +395,10 @@ class Args(CamelCaseModel):
     no_worker: bool = False
     no_downloads: bool = False
     fast_synch: bool | None = None  # None = auto, True = force on, False = force off
+    peers_file: str | None = None  # Path to peers.json config
+    orchestrator: str | None = None  # Orchestrator server address (ip:port)
+    node_name: str | None = None  # Node name for orchestrator registration
+    node_host: str | None = None  # Node's external IP address for orchestrator registration
 
     @classmethod
     def parse(cls) -> Self:
@@ -342,6 +458,30 @@ class Args(CamelCaseModel):
             action="store_false",
             dest="fast_synch",
             help="Force MLX FAST_SYNCH off",
+        )
+        parser.add_argument(
+            "--peers-file",
+            type=str,
+            default=None,
+            help="Path to JSON file containing peer configuration",
+        )
+        parser.add_argument(
+            "--orchestrator",
+            type=str,
+            default=None,
+            help="Orchestrator server address (format: ip:port)",
+        )
+        parser.add_argument(
+            "--node-name",
+            type=str,
+            default=None,
+            help="Node name for orchestrator registration (defaults to hostname)",
+        )
+        parser.add_argument(
+            "--node-host",
+            type=str,
+            default=None,
+            help="Node's external IP address for orchestrator registration (auto-detected if not specified)",
         )
 
         args = parser.parse_args()

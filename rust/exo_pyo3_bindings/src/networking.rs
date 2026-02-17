@@ -293,6 +293,63 @@ async fn networking_task(
 }
 
 #[gen_stub_pyclass]
+#[pyclass(frozen, name = "PeerAddress")]
+#[derive(Debug, Clone)]
+struct PyPeerAddress {
+    #[pyo3(get)]
+    ip: String,
+    #[pyo3(get)]
+    port: u16,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyPeerAddress {
+    #[new]
+    fn new(ip: String, port: u16) -> Self {
+        Self { ip, port }
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass(frozen, name = "NetworkConfig")]
+#[derive(Debug, Clone)]
+struct PyNetworkConfig {
+    #[pyo3(get)]
+    peers: Vec<PyPeerAddress>,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyNetworkConfig {
+    #[new]
+    fn new(peers: Vec<PyPeerAddress>) -> Self {
+        Self { peers }
+    }
+}
+
+fn convert_py_config(py_config: PyNetworkConfig) -> PyResult<networking::swarm::NetworkConfig> {
+    let peers = py_config
+        .peers
+        .into_iter()
+        .map(|peer| {
+            let ip: IpAddr = peer
+                .ip
+                .parse()
+                .map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                        "Invalid IP address '{}': {}",
+                        peer.ip, e
+                    ))
+                })?;
+            Ok((ip, peer.port))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+
+    Ok(networking::swarm::NetworkConfig { peers })
+}
+
+#[gen_stub_pyclass]
 #[pyclass(name = "NetworkingHandle")]
 #[derive(Debug)]
 struct PyNetworkingHandle {
@@ -342,7 +399,10 @@ impl PyNetworkingHandle {
     // ---- Lifecycle management methods ----
 
     #[new]
-    fn py_new(identity: Bound<'_, PyKeypair>) -> PyResult<Self> {
+    fn py_new(
+        identity: Bound<'_, PyKeypair>,
+        config: PyNetworkConfig,
+    ) -> PyResult<Self> {
         use pyo3_async_runtimes::tokio::get_runtime;
 
         // create communication channels
@@ -353,9 +413,12 @@ impl PyNetworkingHandle {
         // get identity
         let identity = identity.borrow().0.clone();
 
+        // convert Python config to Rust config
+        let rust_config = convert_py_config(config)?;
+
         // create networking swarm (within tokio context!! or it crashes)
         let swarm = get_runtime()
-            .block_on(async { create_swarm(identity) })
+            .block_on(async { create_swarm(identity, rust_config) })
             .pyerr()?;
 
         // spawn tokio task running the networking logic
@@ -566,6 +629,8 @@ pub fn networking_submodule(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyConnectionUpdateType>()?;
     m.add_class::<PyConnectionUpdate>()?;
     m.add_class::<PyConnectionUpdateType>()?;
+    m.add_class::<PyPeerAddress>()?;
+    m.add_class::<PyNetworkConfig>()?;
     m.add_class::<PyNetworkingHandle>()?;
 
     Ok(())

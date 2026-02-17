@@ -19,10 +19,17 @@ from exo_pyo3_bindings import (
     NetworkingHandle,
     NoPeersSubscribedToTopicError,
 )
+from exo_pyo3_bindings import (
+    NetworkConfig as PyNetworkConfig,  # type: ignore[attr-defined]
+)
+from exo_pyo3_bindings import (
+    PeerAddress as PyPeerAddress,  # type: ignore[attr-defined]
+)
 from filelock import FileLock
 from loguru import logger
 
 from exo.shared.constants import EXO_NODE_ID_KEYPAIR
+from exo.shared.types.network_config import NetworkConfig
 from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.pydantic_ext import CamelCaseModel
 
@@ -101,8 +108,13 @@ class TopicRouter[T: CamelCaseModel]:
 
 class Router:
     @classmethod
-    def create(cls, identity: Keypair) -> "Router":
-        return cls(handle=NetworkingHandle(identity))
+    def create(cls, identity: Keypair, network_config: NetworkConfig) -> "Router":
+        # Convert Python NetworkConfig to PyO3 NetworkConfig
+        py_peers = [  # pyright: ignore[reportUnknownVariableType]
+            PyPeerAddress(ip=peer.ip, port=peer.port) for peer in network_config.peers
+        ]
+        py_config = PyNetworkConfig(peers=py_peers)  # pyright: ignore[reportUnknownVariableType]
+        return cls(handle=NetworkingHandle(identity, py_config))  # pyright: ignore[reportCallIssue]
 
     def __init__(self, handle: NetworkingHandle):
         self.topic_routers: dict[str, TopicRouter[CamelCaseModel]] = {}
