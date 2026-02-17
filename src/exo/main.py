@@ -27,6 +27,7 @@ from exo.shared.election import Election, ElectionResult
 from exo.shared.logging import logger_cleanup, logger_setup
 from exo.shared.types.common import NodeId, SessionId
 from exo.shared.types.network_config import NetworkConfig
+from exo.shared.types.state import State
 from exo.utils.channels import Receiver, channel
 from exo.utils.pydantic_ext import CamelCaseModel
 from exo.worker.main import Worker
@@ -46,34 +47,9 @@ def get_node_host() -> str:
         return "127.0.0.1"
 
 
-async def fetch_peers_from_orchestrator(orchestrator: str) -> NetworkConfig:
-    """Fetch current peer list from orchestrator."""
-    # Parse orchestrator address
-    if ":" not in orchestrator:
-        raise ValueError(
-            f"Orchestrator address must be in format 'ip:port', got: {orchestrator}"
-        )
-
-    orch_host, orch_port_str = orchestrator.rsplit(":", 1)
-    try:
-        orch_port = int(orch_port_str)
-    except ValueError as e:
-        raise ValueError(
-            f"Invalid orchestrator port '{orch_port_str}', must be an integer"
-        ) from e
-
-    peers_url = f"http://{orch_host}:{orch_port}/peers"
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(peers_url)
-            response.raise_for_status()
-            data: object = response.json()  # pyright: ignore[reportAny]
-            return NetworkConfig.model_validate(data)
-    except httpx.HTTPError as e:
-        raise RuntimeError(f"Failed to fetch peers from orchestrator: {e}") from e
-    except ValidationError as e:
-        raise ValueError(f"Invalid peer configuration from orchestrator: {e}") from e
+def get_active_models(state: State) -> list[str]:
+    """Extract unique model names from active model instances."""
+    return list({instance.shard_assignments.model_id for instance in state.instances.values()})
 
 
 async def register_with_orchestrator(
@@ -81,6 +57,7 @@ async def register_with_orchestrator(
     node_name: str,
     node_host: str,
     node_port: int,
+    active_models: list[str] | None = None,
 ) -> NetworkConfig:
     """Register with orchestrator server and get peer configuration."""
     # Parse orchestrator address
@@ -104,6 +81,7 @@ async def register_with_orchestrator(
         "name": node_name,
         "ip": node_host,
         "port": node_port,
+        "active_models": active_models or [],
     }
 
     logger.info(
@@ -185,9 +163,14 @@ class Node:
     node_id: NodeId
     event_index_counter: Iterator[int]
     orchestrator: str | None  # Orchestrator address if in orchestrator mode
+    node_name: str | None = None  # Node name for orchestrator registration
+    node_host: str | None = None  # Node host IP for orchestrator registration
     known_peer_addresses: set[tuple[str, int]] = field(
         default_factory=set
     )  # Track known peers to avoid re-dialing
+    active_models: list[str] = field(
+        default_factory=list
+    )  # List of active model names (updated from worker state)
     _tg: TaskGroup = field(init=False, default_factory=anyio.create_task_group)
 
     @classmethod
@@ -195,6 +178,10 @@ class Node:
         keypair = get_node_id_keypair()
         node_id = NodeId(keypair.to_peer_id().to_base58())
         session_id = SessionId(master_node_id=node_id, election_clock=0)
+
+        # Store node name and host for orchestrator registration
+        node_name = args.node_name or socket.gethostname() if args.orchestrator else None
+        node_host = args.node_host or get_node_host() if args.orchestrator else None
 
         # In orchestrator mode, we need to get the listening port first before registering
         # So create router with empty peer list initially
@@ -223,13 +210,14 @@ class Node:
             logger.info(f"libp2p listening on port {libp2p_port}")
 
             # Now register with orchestrator using the actual libp2p port
-            node_name = args.node_name or socket.gethostname()
-            node_host = args.node_host or get_node_host()
+            assert node_name is not None
+            assert node_host is not None
             network_config = await register_with_orchestrator(
                 args.orchestrator,
                 node_name,
                 node_host,
                 libp2p_port,
+                active_models=[],  # No models loaded yet on initial registration
             )
 
             # Dial the peers we got from orchestrator
@@ -332,6 +320,8 @@ class Node:
             node_id,
             event_index_counter,
             orchestrator=args.orchestrator,
+            node_name=node_name,
+            node_host=node_host,
             known_peer_addresses=known_peer_addresses,
         )
 
@@ -457,14 +447,33 @@ class Node:
 
         logger.info("Starting peer refresh loop (every 30 seconds)")
 
+        # Get node info for registration (use stored values from initial registration)
+        assert self.node_name is not None
+        assert self.node_host is not None
+        libp2p_port = self.router._net.get_listening_port()  # type: ignore[attr-defined]
+
         while True:
             try:
                 # Wait 30 seconds before checking for new peers
                 await anyio.sleep(30)
 
-                # Fetch current peers from orchestrator
-                logger.debug(f"Fetching peers from orchestrator: {self.orchestrator}")
-                network_config = await fetch_peers_from_orchestrator(self.orchestrator)
+                # Get current active models from worker state
+                current_models: list[str] = []
+                if self.worker:
+                    current_models = get_active_models(self.worker.state)
+                    logger.debug(f"Current active models: {current_models}")
+
+                # Re-register with orchestrator (includes active models and returns peer list)
+                logger.debug(
+                    f"Re-registering with orchestrator: {self.orchestrator} (models: {current_models})"
+                )
+                network_config = await register_with_orchestrator(
+                    self.orchestrator,
+                    self.node_name,
+                    self.node_host,
+                    libp2p_port,  # type: ignore[arg-type]
+                    active_models=current_models,
+                )
 
                 # Check for new peers
                 from exo.shared.types.network_config import PeerAddress
