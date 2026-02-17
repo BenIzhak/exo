@@ -27,11 +27,4 @@ class PeerAddress(FrozenModel):
 
 
 class NetworkConfig(FrozenModel):
-    peers: list[PeerAddress]
-
-    @field_validator("peers")
-    @classmethod
-    def validate_peers(cls, v: list[PeerAddress]) -> list[PeerAddress]:
-        if len(v) == 0:
-            raise ValueError("At least one peer must be specified")
-        return v
+    peers: list[PeerAddress]  # Can be empty for first node in orchestrator mode

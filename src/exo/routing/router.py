@@ -157,6 +157,10 @@ class Router:
 
         return recv
 
+    async def dial_peer(self, ip: str, port: int) -> None:
+        """Dial a peer at the specified IP address and port."""
+        await self._net.dial_peer(ip, port)  # type: ignore[attr-defined]
+
     async def run(self):
         logger.debug("Starting Router")
         try:

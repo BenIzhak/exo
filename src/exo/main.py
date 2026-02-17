@@ -8,7 +8,7 @@ import signal
 import socket
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, Self
+from typing import Iterator, Self, cast
 
 import anyio
 import httpx
@@ -44,6 +44,36 @@ def get_node_host() -> str:
     except Exception:
         # Fallback to localhost if detection fails
         return "127.0.0.1"
+
+
+async def fetch_peers_from_orchestrator(orchestrator: str) -> NetworkConfig:
+    """Fetch current peer list from orchestrator."""
+    # Parse orchestrator address
+    if ":" not in orchestrator:
+        raise ValueError(
+            f"Orchestrator address must be in format 'ip:port', got: {orchestrator}"
+        )
+
+    orch_host, orch_port_str = orchestrator.rsplit(":", 1)
+    try:
+        orch_port = int(orch_port_str)
+    except ValueError as e:
+        raise ValueError(
+            f"Invalid orchestrator port '{orch_port_str}', must be an integer"
+        ) from e
+
+    peers_url = f"http://{orch_host}:{orch_port}/peers"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(peers_url)
+            response.raise_for_status()
+            data: object = response.json()  # pyright: ignore[reportAny]
+            return NetworkConfig.model_validate(data)
+    except httpx.HTTPError as e:
+        raise RuntimeError(f"Failed to fetch peers from orchestrator: {e}") from e
+    except ValidationError as e:
+        raise ValueError(f"Invalid peer configuration from orchestrator: {e}") from e
 
 
 async def register_with_orchestrator(
@@ -112,7 +142,13 @@ async def load_network_config_from_file(peers_file: str | None) -> NetworkConfig
     try:
         content = await anyio.Path(path).read_text()
         data: object = json.loads(content)  # pyright: ignore[reportAny]
-        return NetworkConfig.model_validate(data)
+        config = NetworkConfig.model_validate(data)
+
+        # File mode requires at least one peer
+        if len(config.peers) == 0:
+            raise ValueError("At least one peer must be specified in file mode")
+
+        return config
     except json.JSONDecodeError as e:
         raise ValueError(f"Invalid JSON in peer config: {e}") from e
     except ValidationError as e:
@@ -148,17 +184,65 @@ class Node:
 
     node_id: NodeId
     event_index_counter: Iterator[int]
+    orchestrator: str | None  # Orchestrator address if in orchestrator mode
+    known_peer_addresses: set[tuple[str, int]] = field(
+        default_factory=set
+    )  # Track known peers to avoid re-dialing
     _tg: TaskGroup = field(init=False, default_factory=anyio.create_task_group)
 
     @classmethod
     async def create(cls, args: "Args") -> "Self":
-        # Load peer configuration
-        network_config = await load_network_config(args)
-
         keypair = get_node_id_keypair()
         node_id = NodeId(keypair.to_peer_id().to_base58())
         session_id = SessionId(master_node_id=node_id, election_clock=0)
-        router = Router.create(keypair, network_config)
+
+        # In orchestrator mode, we need to get the listening port first before registering
+        # So create router with empty peer list initially
+        if args.orchestrator:
+            from exo.shared.types.network_config import NetworkConfig, PeerAddress
+
+            empty_config = NetworkConfig(peers=[PeerAddress(ip="127.0.0.1", port=1)])
+            router = Router.create(keypair, empty_config)
+
+            # Wait for router to start listening and get the port
+            listening_port = None
+            for _ in range(50):  # Try for up to 5 seconds
+                listening_port = router._net.get_listening_port()  # type: ignore[attr-defined]
+                if listening_port:
+                    break
+                await anyio.sleep(0.1)
+
+            if not listening_port:
+                raise RuntimeError(
+                    "Failed to get libp2p listening port after 5 seconds"
+                )
+
+            # Type narrowing: listening_port is now definitely int
+            libp2p_port = cast(int, listening_port)
+
+            logger.info(f"libp2p listening on port {libp2p_port}")
+
+            # Now register with orchestrator using the actual libp2p port
+            node_name = args.node_name or socket.gethostname()
+            node_host = args.node_host or get_node_host()
+            network_config = await register_with_orchestrator(
+                args.orchestrator,
+                node_name,
+                node_host,
+                libp2p_port,
+            )
+
+            # Dial the peers we got from orchestrator
+            for peer in network_config.peers:
+                try:
+                    await router.dial_peer(peer.ip, peer.port)
+                    logger.info(f"Dialing peer from orchestrator: {peer.ip}:{peer.port}")
+                except Exception as e:
+                    logger.error(f"Failed to dial peer {peer.ip}:{peer.port}: {e}")
+        else:
+            # File mode - load config and create router
+            network_config = await load_network_config_from_file(args.peers_file)
+            router = Router.create(keypair, network_config)
         await router.register_topic(topics.GLOBAL_EVENTS)
         await router.register_topic(topics.LOCAL_EVENTS)
         await router.register_topic(topics.COMMANDS)
@@ -234,6 +318,9 @@ class Node:
             election_result_sender=er_send,
         )
 
+        # Track initial peers
+        known_peer_addresses = {(peer.ip, peer.port) for peer in network_config.peers}
+
         return cls(
             router,
             download_coordinator,
@@ -244,6 +331,8 @@ class Node:
             api,
             node_id,
             event_index_counter,
+            orchestrator=args.orchestrator,
+            known_peer_addresses=known_peer_addresses,
         )
 
     async def run(self):
@@ -259,6 +348,8 @@ class Node:
             if self.api:
                 tg.start_soon(self.api.run)
             tg.start_soon(self._elect_loop)
+            if self.orchestrator:
+                tg.start_soon(self._peer_refresh_loop)
             signal.signal(signal.SIGINT, lambda _, __: self.shutdown())
             signal.signal(signal.SIGTERM, lambda _, __: self.shutdown())
 
@@ -358,6 +449,50 @@ class Node:
                 else:
                     if self.api:
                         self.api.unpause(result.won_clock)
+
+    async def _peer_refresh_loop(self):
+        """Periodically fetch updated peer list from orchestrator and connect to new peers."""
+        if not self.orchestrator:
+            return
+
+        logger.info("Starting peer refresh loop (every 30 seconds)")
+
+        while True:
+            try:
+                # Wait 30 seconds before checking for new peers
+                await anyio.sleep(30)
+
+                # Fetch current peers from orchestrator
+                logger.debug(f"Fetching peers from orchestrator: {self.orchestrator}")
+                network_config = await fetch_peers_from_orchestrator(self.orchestrator)
+
+                # Check for new peers
+                from exo.shared.types.network_config import PeerAddress
+
+                new_peers: list[PeerAddress] = []
+                for peer in network_config.peers:
+                    peer_addr = (peer.ip, peer.port)
+                    if peer_addr not in self.known_peer_addresses:
+                        new_peers.append(peer)
+                        self.known_peer_addresses.add(peer_addr)
+
+                # Dial new peers
+                if new_peers:
+                    logger.info(f"Found {len(new_peers)} new peer(s), connecting...")
+                    for peer in new_peers:
+                        try:
+                            await self.router.dial_peer(peer.ip, peer.port)
+                            logger.info(f"Dialing new peer: {peer.ip}:{peer.port}")
+                        except Exception as e:
+                            logger.error(
+                                f"Failed to dial peer {peer.ip}:{peer.port}: {e}"
+                            )
+                else:
+                    logger.debug("No new peers found")
+
+            except Exception as e:
+                logger.error(f"Error in peer refresh loop: {e}")
+                # Continue the loop even if there's an error
 
 
 def main():

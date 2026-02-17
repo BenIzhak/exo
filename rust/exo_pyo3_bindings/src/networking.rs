@@ -144,6 +144,10 @@ enum ToTask {
         data: Vec<u8>,
         result_tx: oneshot::Sender<PyResult<MessageId>>,
     },
+    Dial {
+        ip: String,
+        port: u16,
+    },
 }
 
 #[allow(clippy::enum_glob_use)]
@@ -152,6 +156,7 @@ async fn networking_task(
     mut to_task_rx: mpsc::Receiver<ToTask>,
     connection_update_tx: mpsc::Sender<PyConnectionUpdate>,
     gossipsub_message_tx: mpsc::Sender<(String, Vec<u8>)>,
+    listening_port: std::sync::Arc<std::sync::Mutex<Option<u16>>>,
 ) {
     use SwarmEvent::*;
     use ToTask::*;
@@ -209,6 +214,29 @@ async fn networking_task(
                         if let Err(e) = result_tx.send(pyresult) {
                             log::error!("RUST: could not publish gossipsub message since channel already closed: {e:?}");
                             continue;
+                        }
+                    }
+                    Dial { ip, port } => {
+                        use libp2p::{Multiaddr, multiaddr::Protocol};
+
+                        // Parse IP address
+                        let ip_addr: IpAddr = match ip.parse() {
+                            Ok(addr) => addr,
+                            Err(e) => {
+                                log::error!("RUST: invalid IP address '{}': {}", ip, e);
+                                continue;
+                            }
+                        };
+
+                        // Build multiaddr
+                        let addr = Multiaddr::empty()
+                            .with(Protocol::from(ip_addr))
+                            .with(Protocol::Tcp(port));
+
+                        // Dial the peer
+                        log::info!("RUST: dialing peer at {}:{}", ip, port);
+                        if let Err(e) = swarm.dial(addr) {
+                            log::error!("RUST: failed to dial peer: {:?}", e);
                         }
                     }
                 }
@@ -279,6 +307,23 @@ async fn networking_task(
                         }).await {
                             log::error!("RUST: could not send connection update since channel already closed: {e}");
                             continue;
+                        }
+                    },
+                    NewListenAddr { address, .. } => {
+                        // Extract TCP port from the multiaddr
+                        use libp2p::multiaddr::Protocol;
+
+                        let mut port_opt = None;
+                        for protocol in address.iter() {
+                            if let Protocol::Tcp(port) = protocol {
+                                port_opt = Some(port);
+                                break;
+                            }
+                        }
+
+                        if let Some(port) = port_opt {
+                            log::info!("RUST: Listening on TCP port {}", port);
+                            *listening_port.lock().unwrap() = Some(port);
                         }
                     },
                     e => {
@@ -357,6 +402,7 @@ struct PyNetworkingHandle {
     to_task_tx: Option<mpsc::Sender<ToTask>>,
     connection_update_rx: Mutex<mpsc::Receiver<PyConnectionUpdate>>,
     gossipsub_message_rx: Mutex<mpsc::Receiver<(String, Vec<u8>)>>,
+    listening_port: std::sync::Arc<std::sync::Mutex<Option<u16>>>,
 }
 
 impl Drop for PyNetworkingHandle {
@@ -374,11 +420,13 @@ impl PyNetworkingHandle {
         to_task_tx: mpsc::Sender<ToTask>,
         connection_update_rx: mpsc::Receiver<PyConnectionUpdate>,
         gossipsub_message_rx: mpsc::Receiver<(String, Vec<u8>)>,
+        listening_port: std::sync::Arc<std::sync::Mutex<Option<u16>>>,
     ) -> Self {
         Self {
             to_task_tx: Some(to_task_tx),
             connection_update_rx: Mutex::new(connection_update_rx),
             gossipsub_message_rx: Mutex::new(gossipsub_message_rx),
+            listening_port,
         }
     }
 
@@ -410,6 +458,10 @@ impl PyNetworkingHandle {
         let (connection_update_tx, connection_update_rx) = mpsc::channel(MPSC_CHANNEL_SIZE);
         let (gossipsub_message_tx, gossipsub_message_rx) = mpsc::channel(MPSC_CHANNEL_SIZE);
 
+        // create shared state for listening port
+        let listening_port = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let listening_port_clone = listening_port.clone();
+
         // get identity
         let identity = identity.borrow().0.clone();
 
@@ -428,6 +480,7 @@ impl PyNetworkingHandle {
                 to_task_rx,
                 connection_update_tx,
                 gossipsub_message_tx,
+                listening_port_clone,
             )
             .await;
         });
@@ -435,6 +488,7 @@ impl PyNetworkingHandle {
             to_task_tx,
             connection_update_rx,
             gossipsub_message_rx,
+            listening_port,
         ))
     }
 
@@ -597,6 +651,26 @@ impl PyNetworkingHandle {
             .into_iter()
             .map(|(t, d)| (t, d.pybytes()))
             .collect())
+    }
+
+    /// Dial a peer at the specified IP address and port.
+    ///
+    /// This initiates a connection to a new peer. The connection will be established
+    /// asynchronously, and connection updates will be sent via the connection_update channel.
+    async fn dial_peer(&self, ip: String, port: u16) -> PyResult<()> {
+        // send off request to dial
+        self.to_task_tx()
+            .send_py(ToTask::Dial { ip, port })
+            .allow_threads_py() // allow-threads-aware async call
+            .await
+    }
+
+    /// Get the listening port for the libp2p swarm.
+    ///
+    /// Returns None if the swarm hasn't started listening yet.
+    /// This method may block briefly while acquiring the mutex lock.
+    fn get_listening_port(&self) -> Option<u16> {
+        *self.listening_port.lock().unwrap()
     }
 
     // TODO: rn this blocks main thread if anything else is awaiting the channel (bc its a mutex)
